@@ -174,6 +174,57 @@ interface ShaderSnippet {
   body: string;
 }
 
+interface ShaderSources {
+  downsample: string;
+  upsample: string;
+  glass: string;
+}
+
+// Every LiquidEffect instance uses the same immutable shader sources. Reading
+// all three files again for each menu, notification, OSD or application window
+// adds avoidable asynchronous I/O to the exact path where a new surface is
+// being shown. Cache the in-flight Promise as well as the completed result so
+// concurrently-created effects still perform a single set of reads.
+const _shaderSourceCache = new Map<string, Promise<ShaderSources>>();
+
+function _readTextFile(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const file = Gio.File.new_for_path(path);
+    file.load_contents_async(null, (_, res) => {
+      try {
+        const [ok, bytes] = file.load_contents_finish(res);
+        if (!ok) {
+          reject(new Error(`load_contents_finish returned false for ${path}`));
+          return;
+        }
+        resolve(new TextDecoder('utf-8').decode(bytes));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+function _loadShaderSources(extensionPath: string): Promise<ShaderSources> {
+  let pending = _shaderSourceCache.get(extensionPath);
+  if (pending) return pending;
+
+  pending = Promise.all([
+    _readTextFile(`${extensionPath}/shaders/downsample.frag`),
+    _readTextFile(`${extensionPath}/shaders/upsample.frag`),
+    _readTextFile(`${extensionPath}/shaders/glass.frag`),
+  ]).then(([downsample, upsample, glass]) => ({ downsample, upsample, glass }));
+
+  // A failed read must not poison the cache permanently. A later effect may
+  // succeed after an installation/update has finished copying the files.
+  pending.catch(() => {
+    if (_shaderSourceCache.get(extensionPath) === pending)
+      _shaderSourceCache.delete(extensionPath);
+  });
+  _shaderSourceCache.set(extensionPath, pending);
+  return pending;
+}
+
 // ─── Blur method ─────────────────────────────────────────────────────────────
 // 0: Separable Gaussian blur (shader source generated dynamically on the TS side)
 // 1: Dual Kawase blur (downsample.frag + upsample.frag) — the original implementation
@@ -281,6 +332,10 @@ export const LiquidEffect = GObject.registerClass({
   // ── Same as above, but for array uniforms (region_x[], region_tint_r[], etc.) ──
   declare private _compUniformArrays: Map<string, number>;
   declare private _pendingUniformArrays: Map<string, number[]>;
+  declare private _glassRegionsCache: {
+    x: number; y: number; w: number; h: number;
+    tintR: number; tintG: number; tintB: number; baseStrength: number;
+  }[];
 
   // ── Crop texture pool ──
   // Some Cogl/Clutter versions return a get_texture() whose size is larger
@@ -316,6 +371,12 @@ export const LiquidEffect = GObject.registerClass({
   declare private _upsampleSource: string | null;
   declare private _glassSource: string | null;
   declare private _shadersLoaded: boolean;
+  declare private _disposed: boolean;
+
+  // Reused across frames. Allocating a new boxed Cogl.Color in every paint is
+  // unnecessary; the pipeline copies the value when set_color() is called.
+  declare private _compositeColor: Cogl.Color;
+  declare private _lastPaintOpacity: number;
 
   // ── [DIAG] Black-background investigation ──
   // Tracks whether/how often vfunc_paint_target actually gets invoked by
@@ -333,6 +394,9 @@ export const LiquidEffect = GObject.registerClass({
   // Per-pass pipeline copies. See _passPipeline() for why a shared pipeline
   // cannot work now that the passes are deferred paint nodes.
   declare private _passPipelines: Map<string, { base: Cogl.Pipeline, copy: Cogl.Pipeline }>;
+  declare private _pipelineTextureBindings: WeakMap<Cogl.Pipeline, Map<number, Cogl.Texture>>;
+  declare private _passUniformLocations: WeakMap<Cogl.Pipeline, Map<string, number>>;
+  declare private _passUniformValues: WeakMap<Cogl.Pipeline, Map<string, number[]>>;
 
   // Latch so the "composite layers disagree on UV range" warning is logged at
   // most once; see _addCompositeNode().
@@ -366,6 +430,7 @@ export const LiquidEffect = GObject.registerClass({
     this._pendingUniforms = new Map();
     this._compUniformArrays = new Map();
     this._pendingUniformArrays = new Map();
+    this._glassRegionsCache = [];
     this._poolWidth = 0;
     this._poolHeight = 0;
     this._cropTexture = null;
@@ -391,17 +456,23 @@ export const LiquidEffect = GObject.registerClass({
     this._upsampleSource = null;
     this._glassSource = null;
     this._shadersLoaded = false;
+    this._disposed = false;
+    this._compositeColor = new Cogl.Color();
+    this._lastPaintOpacity = -1;
     this._diagPaintCount = 0;
     this._diagLast = null;
     _liveEffects.add(this);
     _registerGlassDebugHooks();
     this._diagCompositedPaintCount = 0;
     this._diagLastPaintLogAt = 0;
-    this._uvMismatchWarned = false;
     this._passPipelines = new Map();
+    this._pipelineTextureBindings = new WeakMap();
+    this._passUniformLocations = new WeakMap();
+    this._passUniformValues = new WeakMap();
+    this._uvMismatchWarned = false;
     this._diagFirstPaintLogged = false;
-    this._passPipelines = new Map();
-    this._uvMismatchWarned = false;
+    this._batchDepth = 0;
+    this._batchDirty = false;
 
     this._extensionPath = extensionPath;
     this._settings = settings;
@@ -454,7 +525,13 @@ export const LiquidEffect = GObject.registerClass({
     // completely unaffected. See setMultiRegionMode()/setGlassRegions().
     this._setFloat('multi_region_mode', 0.0);
     this._setFloat('region_count', 0.0);
-    this._setFloat('fast_mode', LiquidEffect.DRAG_PERF_MODE_ENABLED ? 1.0 : 0.0);
+    // Fast mode is opt-in while an application window is actively dragged.
+    // Initialising it from the master feature flag accidentally left every
+    // non-application effect in fast mode permanently.
+    this._setFloat('fast_mode', 0.0);
+    this._setFloat('material_mode', 0.0);
+    this._setFloat('frosted_strength', 0.55);
+    this._setFloat('frosted_grain', 0.018);
 
     this._settingsIds = [];
     if (this._settings) {
@@ -495,54 +572,32 @@ export const LiquidEffect = GObject.registerClass({
   * Load all shader files asynchronously.
   */
   private async _loadAllShadersAsync(): Promise<void> {
-    // [DIAG] Black-background investigation: each LiquidEffect instance loads
-    // its own copy of the 3 shader files independently (no cross-instance
-    // cache), so a brand-new window's glass literally cannot render until
-    // this completes. Log start/duration to see how long this actually takes
-    // relative to the window's own open animation, and to correlate with the
-    // applicationManager diag logs (search for "[Liquid Glass][diag]").
-    const diagStart = GLib.get_monotonic_time();
-    this._logger?.log(`[Liquid Glass][diag] LiquidEffect: starting async shader load at t=${diagStart}us ` +
-      `(extensionPath=${this._extensionPath})`);
+    const diagStart = this._logger?.enabled ? GLib.get_monotonic_time() : 0;
+    const extensionPath = this._extensionPath;
+    if (!extensionPath) {
+      this._logger?.error('[Liquid Glass] Cannot load shaders without an extension path');
+      return;
+    }
     try {
-      this._downsampleSource = await this._readFileAsync(`${this._extensionPath}/shaders/downsample.frag`);
-      this._upsampleSource = await this._readFileAsync(`${this._extensionPath}/shaders/upsample.frag`);
-      this._glassSource = await this._readFileAsync(`${this._extensionPath}/shaders/glass.frag`);
+      const sources = await _loadShaderSources(extensionPath);
+      if (this._disposed) return;
+
+      this._downsampleSource = sources.downsample;
+      this._upsampleSource = sources.upsample;
+      this._glassSource = sources.glass;
 
       this._shadersLoaded = true;
 
-      const elapsedMs = (GLib.get_monotonic_time() - diagStart) / 1000;
-      this._logger?.log(`[Liquid Glass][diag] LiquidEffect: async shader load finished in ${elapsedMs.toFixed(1)}ms, ` +
-        `calling queue_repaint() now. If the on-screen black-background bug is still visible ` +
-        `after this point, the shader load itself is not the (sole) cause -- the issue is in ` +
-        `getting this repaint request actually flushed to the display.`);
+      if (this._logger?.enabled) {
+        const elapsedMs = (GLib.get_monotonic_time() - diagStart) / 1000;
+        this._logger.log(`[Liquid Glass][diag] Shared shader sources ready in ${elapsedMs.toFixed(1)}ms`);
+      }
 
       // 読み込み完了後に再描画をリクエストし、パイプラインを初期化させる
       this.queue_repaint();
     } catch (e) {
       this._logger?.error(`[Liquid Glass] Failed to load shaders asynchronously: ${e}`);
     }
-  }
-
-  /**
-  * Gio.File を使ってファイルを非同期で読み込み、文字列として返すPromise関数
-  */
-  private _readFileAsync(path: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const file = Gio.File.new_for_path(path);
-      file.load_contents_async(null, (_, res) => {
-        try {
-          const [ok, bytes] = file.load_contents_finish(res);
-          if (!ok) {
-            reject(new Error(`load_contents_finish returned false for ${path}`));
-          } else {
-            resolve(new TextDecoder('utf-8').decode(bytes));
-          }
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
   }
 
   // ─── Pipeline initialization (deferred until the first frame, once a Cogl context exists) ──
@@ -582,6 +637,8 @@ export const LiquidEffect = GObject.registerClass({
     // ── Composite pipeline (glass.frag) ──────────────────────────────────────
     this._compositePipeline = Cogl.Pipeline.new(ctx);
     this._configureSamplerLayer(this._compositePipeline, 0);
+    this._configureSamplerLayer(this._compositePipeline, 1);
+    this._lastPaintOpacity = -1;
 
     // Standard premultiplied-alpha blending, equivalent to ShaderEffect's default:
     // "src.rgb + dst.rgb * (1 - src.a)"
@@ -846,7 +903,7 @@ export const LiquidEffect = GObject.registerClass({
       const uv = (i === 0) ? srcUV : [0, 0, 1, 1];
 
       const pipeline = this._passPipeline(`kawase-down-${i}`, this._downsamplePipeline!);
-      pipeline.set_layer_texture(0, currentSrc);
+      this._bindPipelineTexture(pipeline, 0, currentSrc);
       this._setPipelineVec2(pipeline, 'inv_size', invW, invH);
       this._setPipelineFloat(pipeline, 'blur_radius', this._blurRadiusDown);
 
@@ -880,7 +937,7 @@ export const LiquidEffect = GObject.registerClass({
       const invH = 1.0 / srcTexture.get_height();
 
       const pipeline = this._passPipeline(`kawase-up-${i}`, this._upsamplePipeline!);
-      pipeline.set_layer_texture(0, srcTexture);
+      this._bindPipelineTexture(pipeline, 0, srcTexture);
       this._setPipelineVec2(pipeline, 'inv_size', invW, invH);
       this._setPipelineFloat(pipeline, 'blur_radius', this._blurRadiusUp);
 
@@ -918,7 +975,7 @@ export const LiquidEffect = GObject.registerClass({
     // half-resolution space. (Reuses the Dual Kawase downsample pipeline with
     // radius 0.)
     const prePipeline = this._passPipeline('gauss-pre', this._downsamplePipeline!);
-    prePipeline.set_layer_texture(0, srcTex);
+    this._bindPipelineTexture(prePipeline, 0, srcTex);
     this._setPipelineVec2(prePipeline, 'inv_size', 1.0 / srcW, 1.0 / srcH);
     this._setPipelineFloat(prePipeline, 'blur_radius', 0.0);
 
@@ -930,7 +987,7 @@ export const LiquidEffect = GObject.registerClass({
     // ── 1. Horizontal pass: destTex (half res) → tempTex (half res) ─────────
     // Input is already half-resolution, so inv_size uses destW/destH directly.
     const hPipeline = this._passPipeline('gauss-h', this._gaussianHPipeline!);
-    hPipeline.set_layer_texture(0, destTex);
+    this._bindPipelineTexture(hPipeline, 0, destTex);
     this._setPipelineVec2(hPipeline, 'inv_size', 1.0 / destW, 1.0 / destH);
     this._setPipelineFloat(hPipeline, 'kernel_scale', this._gaussianScale);
 
@@ -942,7 +999,7 @@ export const LiquidEffect = GObject.registerClass({
     // tempFbo already depends on destFbo (the horizontal pass read destTex) —
     // the exact cycle Cogl rejects now that these passes are deferred nodes.
     const vPipeline = this._passPipeline('gauss-v', this._gaussianVPipeline!);
-    vPipeline.set_layer_texture(0, tempTex);
+    this._bindPipelineTexture(vPipeline, 0, tempTex);
     this._setPipelineVec2(vPipeline, 'inv_size', 1.0 / destW, 1.0 / destH);
     this._setPipelineFloat(vPipeline, 'kernel_scale', this._gaussianScale);
 
@@ -970,6 +1027,12 @@ export const LiquidEffect = GObject.registerClass({
     this._blurResultTex = null;
     this._poolWidth = 0;
     this._poolHeight = 0;
+    // Per-pass pipeline copies retain their bound textures. Drop them when
+    // the pool changes so old render targets can be reclaimed immediately.
+    this._passPipelines.clear();
+    this._pipelineTextureBindings = new WeakMap();
+    this._passUniformLocations = new WeakMap();
+    this._passUniformValues = new WeakMap();
   }
 
   // ─── Crop pass (works around OffscreenEffect FBO padding) ───────────────────
@@ -1065,7 +1128,7 @@ export const LiquidEffect = GObject.registerClass({
     if (!this._ensureCropTarget(ctx, allocW, allocH)) return srcTex;
 
     const pipeline = this._passPipeline('crop', this._downsamplePipeline);
-    pipeline.set_layer_texture(0, srcTex);
+    this._bindPipelineTexture(pipeline, 0, srcTex);
     this._setPipelineVec2(pipeline, 'inv_size', 1.0 / srcW, 1.0 / srcH);
     // blur_radius = 0 collapses every tap in the 5-tap kernel onto the center
     // sample, turning this into a plain UV resample (i.e. a crop).
@@ -1103,8 +1166,8 @@ export const LiquidEffect = GObject.registerClass({
     // function never runs at all -- which would show up here as a call count
     // that never advances past whatever it was when the window opened, even
     // though _frameTick keeps calling set_size()/queue_redraw() at 60fps.
-    this._diagPaintCount++;
-    {
+    if (this._logger?.enabled) {
+      this._diagPaintCount++;
       const now = GLib.get_monotonic_time();
       const actorTitle = (() => {
         try {
@@ -1284,8 +1347,7 @@ export const LiquidEffect = GObject.registerClass({
     // Layer 0: the sharp, unblurred capture (used as the basis for refraction).
     // Using the cropped texture means UV (0,0)-(1,1) lines up exactly with
     // the actor's logical size.
-    compPipeline.set_layer_texture(0, effectiveTex);
-    this._configureSamplerLayer(compPipeline, 0);
+    this._bindPipelineTexture(compPipeline, 0, effectiveTex);
     // [FIX] Layer 0 is now the RAW capture rather than a cropped copy, so it
     // must be sampled over srcUV. Layer 1 (below) is one of our own pool
     // textures, which is already padding-free and uses the full 0..1 range —
@@ -1298,20 +1360,16 @@ export const LiquidEffect = GObject.registerClass({
     // [FIX round 12] The finished blur no longer always lands in
     // _blurTextures[0]; whichever runner executed records its output here.
     if (this.PASS_COUNT > 0 && this._blurResultTex) {
-      compPipeline.set_layer_texture(1, this._blurResultTex);
+      this._bindPipelineTexture(compPipeline, 1, this._blurResultTex);
       layer1UV = [0, 0, 1, 1];
     } else {
       // No blur ran, so layer 1 falls back to the same raw capture as
       // layer 0 and therefore needs the same sub-rect.
-      compPipeline.set_layer_texture(1, effectiveTex);
+      this._bindPipelineTexture(compPipeline, 1, effectiveTex);
       layer1UV = inputUV;
     }
-    this._configureSamplerLayer(compPipeline, 1);
-
-    // Manually sync pending uniforms into the composite pipeline.
-    // Without this, values like dock_x would stay at 0 and the whole screen
-    // would be misdetected as being inside the dock mask.
-    this._applyPendingUniforms();
+    // Uniforms persist on the reused pipeline. Initial values are uploaded by
+    // _initPipelines(), and subsequent setters upload only changed values.
 
     // [FIX] Feed the actor's real, cascaded paint opacity into the pipeline
     // color used for the final draw. glass.frag's very last line already
@@ -1338,10 +1396,13 @@ export const LiquidEffect = GObject.registerClass({
     // during open/close animations. Scaling all four channels by the same
     // factor keeps it correctly premultiplied at every opacity level.
     const paintOpacity = actor ? actor.get_paint_opacity() : 255;
-    const color = new Cogl.Color();
-    const paintOpacity_f = paintOpacity / 255;
-    color.init_from_4f(paintOpacity_f, paintOpacity_f, paintOpacity_f, paintOpacity_f);
-    this._compositePipeline!.set_color(color);
+    if (paintOpacity !== this._lastPaintOpacity) {
+      const paintOpacity_f = paintOpacity / 255;
+      this._compositeColor.init_from_4f(
+        paintOpacity_f, paintOpacity_f, paintOpacity_f, paintOpacity_f);
+      this._compositePipeline!.set_color(this._compositeColor);
+      this._lastPaintOpacity = paintOpacity;
+    }
 
     // [FIX round 10] The push_matrix()/pop_matrix() pair that used to wrap
     // this draw is gone: nothing modified the matrix between them (so it was
@@ -1358,7 +1419,8 @@ export const LiquidEffect = GObject.registerClass({
     // computeCaptureLayout() in utils.ts for how the correct rect is derived.
     this._addCompositeNode(_paintNode, layout.dest, layer0UV, layer1UV);
 
-    this._diagCompositedPaintCount++;
+    if (this._logger?.enabled)
+      this._diagCompositedPaintCount++;
 
     // [DIAG] "Blur is not visible — the background inside the glass stays
     // sharp — but changing the blur radius does change the look, and
@@ -1368,29 +1430,31 @@ export const LiquidEffect = GObject.registerClass({
     // when _blurResultTex is null and the fallback below binds the raw
     // capture. This records the state that decides it, per instance, for
     // global._lgGlass.dump().
-    this._diagLast = {
-      actor: (() => { try { return (this.get_actor() as any)?.get_name?.() ?? '?'; } catch (e) { return '?'; } })(),
-      src: `${srcW}x${srcH}`,
-      alloc: `${allocW}x${allocH}`,
-      uv: layout.uv.map(v => +v.toFixed(5)),
-      dest: layout.dest.map(v => +v.toFixed(2)),
-      cropRan: effectiveTex !== srcTex,
-      blurMethod: this._blurMethod,
-      passCount: this.PASS_COUNT,
-      pool: `${this._poolWidth}x${this._poolHeight}`,
-      poolLevels: this._blurFbos.length,
-      blurResult: (() => {
-        const t = this._blurResultTex as Cogl.Texture | null;
-        return t ? `${t.get_width()}x${t.get_height()}`
-          : 'NULL (layer 1 falls back to the SHARP capture)';
-      })(),
-      radiusDown: this._blurRadiusDown,
-      radiusUp: this._blurRadiusUp,
-      targetRadius: this._targetRadius,
-      gaussianPipelines: !!(this._gaussianHPipeline && this._gaussianVPipeline),
-      paintOpacity,
-      paints: this._diagPaintCount,
-    };
+    if (this._logger?.enabled) {
+      this._diagLast = {
+        actor: (() => { try { return (this.get_actor() as any)?.get_name?.() ?? '?'; } catch (e) { return '?'; } })(),
+        src: `${srcW}x${srcH}`,
+        alloc: `${allocW}x${allocH}`,
+        uv: layout.uv.map(v => +v.toFixed(5)),
+        dest: layout.dest.map(v => +v.toFixed(2)),
+        cropRan: effectiveTex !== srcTex,
+        blurMethod: this._blurMethod,
+        passCount: this.PASS_COUNT,
+        pool: `${this._poolWidth}x${this._poolHeight}`,
+        poolLevels: this._blurFbos.length,
+        blurResult: (() => {
+          const t = this._blurResultTex as Cogl.Texture | null;
+          return t ? `${t.get_width()}x${t.get_height()}`
+            : 'NULL (layer 1 falls back to the SHARP capture)';
+        })(),
+        radiusDown: this._blurRadiusDown,
+        radiusUp: this._blurRadiusUp,
+        targetRadius: this._targetRadius,
+        gaussianPipelines: !!(this._gaussianHPipeline && this._gaussianVPipeline),
+        paintOpacity,
+        paints: this._diagPaintCount,
+      };
+    }
   }
 
   /**
@@ -1505,25 +1569,73 @@ export const LiquidEffect = GObject.registerClass({
   // ─── Uniform helpers ─────────────────────────────────────────────────────────
 
   /**
-   * Sets a vec2 uniform on a pipeline. Cogl caches the uniform location
-   * internally, so calling this every frame is safe.
+   * Binds a texture only when a pipeline's layer actually changes. Pool
+   * textures are normally stable for many frames even though their content
+   * is rendered afresh each frame.
    */
+  private _bindPipelineTexture(
+    pipeline: Cogl.Pipeline, layer: number, texture: Cogl.Texture
+  ): void {
+    let bindings = this._pipelineTextureBindings.get(pipeline);
+    if (!bindings) {
+      bindings = new Map();
+      this._pipelineTextureBindings.set(pipeline, bindings);
+    }
+    if (bindings.get(layer) === texture) return;
+
+    pipeline.set_layer_texture(layer, texture);
+    bindings.set(layer, texture);
+  }
+
+  private _getPassUniformLocation(pipeline: Cogl.Pipeline, name: string): number {
+    let locations = this._passUniformLocations.get(pipeline);
+    if (!locations) {
+      locations = new Map();
+      this._passUniformLocations.set(pipeline, locations);
+    }
+
+    let location = locations.get(name);
+    if (location === undefined) {
+      location = pipeline.get_uniform_location(name);
+      locations.set(name, location);
+    }
+    return location;
+  }
+
+  private _getPassUniformValues(pipeline: Cogl.Pipeline): Map<string, number[]> {
+    let values = this._passUniformValues.get(pipeline);
+    if (!values) {
+      values = new Map();
+      this._passUniformValues.set(pipeline, values);
+    }
+    return values;
+  }
+
+  /** Sets a vec2 uniform only when its value changed. */
   private _setPipelineVec2(
     pipeline: Cogl.Pipeline, name: string, x: number, y: number
   ): void {
-    const loc = pipeline.get_uniform_location(name);
+    const values = this._getPassUniformValues(pipeline);
+    const previous = values.get(name);
+    if (previous && Object.is(previous[0], x) && Object.is(previous[1], y)) return;
+
+    const loc = this._getPassUniformLocation(pipeline, name);
     // set_uniform_float(loc, n_components, count, values[])
     pipeline.set_uniform_float(loc, 2, 1, [x, y]);
+    values.set(name, [x, y]);
   }
 
-  /**
-   * Sets a scalar float uniform on a pipeline.
-   */
+  /** Sets a scalar float uniform only when its value changed. */
   private _setPipelineFloat(
     pipeline: Cogl.Pipeline, name: string, value: number
   ): void {
-    const loc = pipeline.get_uniform_location(name);
+    const values = this._getPassUniformValues(pipeline);
+    const previous = values.get(name);
+    if (previous && Object.is(previous[0], value)) return;
+
+    const loc = this._getPassUniformLocation(pipeline, name);
     pipeline.set_uniform_float(loc, 1, 1, [value]);
+    values.set(name, [value]);
   }
 
   /**
@@ -1531,11 +1643,22 @@ export const LiquidEffect = GObject.registerClass({
    * been created yet, the value is buffered in _pendingUniforms and applied
    * later in _applyPendingUniforms().
    */
-  private _setFloat(name: string, value: number): void {
+  private _setFloat(name: string, value: number): boolean {
+    const previous = this._pendingUniforms.get(name);
+    if (previous !== undefined && Object.is(previous, value)) return false;
+
     this._pendingUniforms.set(name, value);
     if (this._compositePipeline) {
       this._applyUniform(name, value);
     }
+    return true;
+  }
+
+  private _setFloats(entries: [string, number][]): boolean {
+    let changed = false;
+    for (const [name, value] of entries)
+      changed = this._setFloat(name, value) || changed;
+    return changed;
   }
 
   private _applyUniform(name: string, value: number): void {
@@ -1566,11 +1689,21 @@ export const LiquidEffect = GObject.registerClass({
    * _setFloat(): if the pipeline hasn't been created yet, the value is
    * buffered and applied later in _applyPendingUniforms().
    */
-  private _setFloatArray(name: string, values: number[]): void {
-    this._pendingUniformArrays.set(name, values);
-    if (this._compositePipeline) {
-      this._applyUniformArray(name, values);
+  private _setFloatArray(name: string, values: number[]): boolean {
+    const previous = this._pendingUniformArrays.get(name);
+    if (previous && previous.length === values.length &&
+      previous.every((value, index) => Object.is(value, values[index]))) {
+      return false;
     }
+
+    // Callers often reuse and mutate their arrays. Keep our own snapshot so
+    // equality checks remain valid on the next frame.
+    const snapshot = [...values];
+    this._pendingUniformArrays.set(name, snapshot);
+    if (this._compositePipeline) {
+      this._applyUniformArray(name, snapshot);
+    }
+    return true;
   }
 
   private _applyUniformArray(name: string, values: number[]): void {
@@ -1624,6 +1757,8 @@ export const LiquidEffect = GObject.registerClass({
       // outer drop shadow's radius/intensity pair above.
       { key: 'glass-ao-intensity', uniform: 'ao_intensity' },
       { key: 'glass-ao-radius', uniform: 'ao_radius' },
+      { key: 'frosted-strength', uniform: 'frosted_strength' },
+      { key: 'frosted-grain', uniform: 'frosted_grain' },
     ];
 
     const settings = this._settings;
@@ -1634,7 +1769,8 @@ export const LiquidEffect = GObject.registerClass({
       this._setFloat(map.uniform, settings.get_double(map.key));
       // Watch for changes.
       const id = settings.connect(`changed::${map.key}`, () => {
-        this._setFloat(map.uniform, settings.get_double(map.key));
+        if (this._setFloat(map.uniform, settings.get_double(map.key)))
+          this.queue_repaint();
       });
       this._settingsIds.push(id);
     });
@@ -1649,11 +1785,21 @@ export const LiquidEffect = GObject.registerClass({
     const blurMethodId = settings.connect('changed::blur-method', applyBlurMethod);
     this._settingsIds.push(blurMethodId);
 
+    const applyMaterialMode = () => {
+      const mode = Math.max(0, Math.min(2, settings.get_int('material-mode')));
+      if (this._setFloat('material_mode', mode))
+        this.queue_repaint();
+    };
+    applyMaterialMode();
+    const materialModeId = settings.connect('changed::material-mode', applyMaterialMode);
+    this._settingsIds.push(materialModeId);
+
   }
 
   // ─── Public API (compatible with the previous ShaderEffect-based interface) ──
 
   cleanup(): void {
+    this._disposed = true;
     _liveEffects.delete(this);
 
     // Disconnect GSettings signal handlers.
@@ -1677,6 +1823,9 @@ export const LiquidEffect = GObject.registerClass({
     this._pendingUniforms.clear();
     this._compUniformArrays.clear();
     this._pendingUniformArrays.clear();
+    this._glassRegionsCache = [];
+    this._passPipelines.clear();
+    this._lastPaintOpacity = -1;
 
     // Reset the dynamic Gaussian shader generation state too.
     this._gaussianKernel = null;
@@ -1702,8 +1851,8 @@ export const LiquidEffect = GObject.registerClass({
    * menu, notification, quick-settings and OSD still use.
    */
   setSurfaceLightEnabled(enabled: boolean): void {
-    this._setFloat('surface_light_enabled', enabled ? 1.0 : 0.0);
-    this.queue_repaint();
+    if (this._setFloat('surface_light_enabled', enabled ? 1.0 : 0.0))
+      this.queue_repaint();
   }
 
   setPadding(pad: number): void {
@@ -1749,6 +1898,8 @@ export const LiquidEffect = GObject.registerClass({
     this._gaussianFetchPairs = 0;
     this._compUniforms.clear();
     this._compUniformArrays.clear();
+    this._passPipelines.clear();
+    this._lastPaintOpacity = -1;
     // _pendingUniforms/_pendingUniformArrays are intentionally left intact:
     // they hold every uniform value currently in effect, and
     // _initPipelines() re-applies all of them to the freshly-compiled
@@ -1757,14 +1908,19 @@ export const LiquidEffect = GObject.registerClass({
     // _gaussianPipelineDirty / _pendingGaussianKernel get set correctly
     // instead of leaving the Gaussian pass permanently skipped.
     this.setBlurRadius(this._targetRadius);
-    this.queue_repaint();
+
+    // Development-only hot reload must bypass the shared source cache.
+    const extensionPath = this._extensionPath;
+    if (extensionPath) _shaderSourceCache.delete(extensionPath);
+    this._shadersLoaded = false;
+    void this._loadAllShadersAsync();
   }
 
   setTintColor(r: number, g: number, b: number): void {
-    this._setFloat('tint_r', r);
-    this._setFloat('tint_g', g);
-    this._setFloat('tint_b', b);
-    this.queue_repaint();
+    const changed = this._setFloats([
+      ['tint_r', r], ['tint_g', g], ['tint_b', b],
+    ]);
+    if (changed) this.queue_repaint();
   }
 
   // Sets the flat fallback fill composited underneath the glass/shadow
@@ -1772,11 +1928,11 @@ export const LiquidEffect = GObject.registerClass({
   // panel_bg_* uniforms for the full rationale. Pass alpha = 0 (the
   // default) to disable it entirely.
   setPanelBackgroundColor(r: number, g: number, b: number, a: number): void {
-    this._setFloat('panel_bg_r', r);
-    this._setFloat('panel_bg_g', g);
-    this._setFloat('panel_bg_b', b);
-    this._setFloat('panel_bg_a', a);
-    this.queue_repaint();
+    const changed = this._setFloats([
+      ['panel_bg_r', r], ['panel_bg_g', g],
+      ['panel_bg_b', b], ['panel_bg_a', a],
+    ]);
+    if (changed) this.queue_repaint();
   }
 
   // [FIX] The panel's REAL widget bounds (monitor-relative px, no
@@ -1786,33 +1942,32 @@ export const LiquidEffect = GObject.registerClass({
   // the panel_rect_* uniform comments in glass.frag for the full
   // rationale. Harmless to call regardless of panel_bg_a.
   setPanelRect(x: number, y: number, w: number, h: number): void {
-    this._setFloat('panel_rect_x', x);
-    this._setFloat('panel_rect_y', y);
-    this._setFloat('panel_rect_w', w);
-    this._setFloat('panel_rect_h', h);
-    this.queue_repaint();
+    const changed = this._setFloats([
+      ['panel_rect_x', x], ['panel_rect_y', y],
+      ['panel_rect_w', w], ['panel_rect_h', h],
+    ]);
+    if (changed) this.queue_repaint();
   }
 
   setTintStrength(strength: number): void {
-    this._setFloat('tint_strength', strength);
-    this.queue_repaint();
+    if (this._setFloat('tint_strength', strength))
+      this.queue_repaint();
   }
 
   setCornerRadius(radius: number): void {
-    this._setFloat('corner_radius', radius);
-    this.queue_repaint();
+    if (this._setFloat('corner_radius', radius))
+      this.queue_repaint();
   }
 
   setAnimationScale(scale: number): void {
     const settings = this._settings;
     if (!settings) return;
-    this._setFloat('displacement_scale',
-      settings.get_double('glass-displacement-scale') * scale);
-    this._setFloat('max_z',
-      settings.get_double('glass-max-z') * scale);
-    this._setFloat('chroma_strength',
-      settings.get_double('glass-chroma-strength') * scale);
-    this.queue_repaint();
+    const changed = this._setFloats([
+      ['displacement_scale', settings.get_double('glass-displacement-scale') * scale],
+      ['max_z', settings.get_double('glass-max-z') * scale],
+      ['chroma_strength', settings.get_double('glass-chroma-strength') * scale],
+    ]);
+    if (changed) this.queue_repaint();
   }
 
   setPointerPosition(x: number, y: number, intensity: number): void {
@@ -1829,9 +1984,10 @@ export const LiquidEffect = GObject.registerClass({
    * needed here.
    */
   setResolution(width: number, height: number): void {
-    this._setFloat('resolution_x', width);
-    this._setFloat('resolution_y', height);
-    this.queue_repaint();
+    const changed = this._setFloats([
+      ['resolution_x', width], ['resolution_y', height],
+    ]);
+    if (changed) this.queue_repaint();
   }
 
   /**
@@ -1839,11 +1995,10 @@ export const LiquidEffect = GObject.registerClass({
    * shader (see the dock_x/y/w/h comments in glass.frag for details).
    */
   setGlassGeometry(x: number, y: number, w: number, h: number): void {
-    this._setFloat('dock_x', x);
-    this._setFloat('dock_y', y);
-    this._setFloat('dock_w', w);
-    this._setFloat('dock_h', h);
-    this.queue_repaint();
+    const changed = this._setFloats([
+      ['dock_x', x], ['dock_y', y], ['dock_w', w], ['dock_h', h],
+    ]);
+    if (changed) this.queue_repaint();
   }
 
   /**
@@ -1855,8 +2010,8 @@ export const LiquidEffect = GObject.registerClass({
    * and is completely unaffected.
    */
   setMultiRegionMode(enabled: boolean): void {
-    this._setFloat('multi_region_mode', enabled ? 1.0 : 0.0);
-    this.queue_repaint();
+    if (this._setFloat('multi_region_mode', enabled ? 1.0 : 0.0))
+      this.queue_repaint();
   }
 
   // [PERF] "Window background rendering gets noticeably more expensive
@@ -1924,7 +2079,8 @@ export const LiquidEffect = GObject.registerClass({
    */
   setFastMode(enabled: boolean): void {
     const value = (LiquidEffect.DRAG_PERF_MODE_ENABLED && enabled) ? 1.0 : 0.0;
-    this._setFloat('fast_mode', value);
+    if (this._setFloat('fast_mode', value))
+      this.queue_repaint();
   }
 
   /**
@@ -1951,6 +2107,23 @@ export const LiquidEffect = GObject.registerClass({
   }[]): void {
     const clamped = regions.slice(0, LiquidEffect.MAX_GLASS_REGIONS);
 
+    const unchanged = this._glassRegionsCache.length === clamped.length &&
+      clamped.every((region, index) => {
+        const cached = this._glassRegionsCache[index];
+        return cached.x === region.x && cached.y === region.y &&
+          cached.w === region.w && cached.h === region.h &&
+          cached.tintR === region.tintR && cached.tintG === region.tintG &&
+          cached.tintB === region.tintB &&
+          cached.baseStrength === Math.max(0.0, Math.min(1.0, region.baseStrength ?? 0.0));
+      });
+    if (unchanged) return;
+
+    this._glassRegionsCache = clamped.map(region => ({
+      x: region.x, y: region.y, w: region.w, h: region.h,
+      tintR: region.tintR, tintG: region.tintG, tintB: region.tintB,
+      baseStrength: Math.max(0.0, Math.min(1.0, region.baseStrength ?? 0.0)),
+    }));
+
     const rx = new Array(LiquidEffect.MAX_GLASS_REGIONS).fill(0.0);
     const ry = new Array(LiquidEffect.MAX_GLASS_REGIONS).fill(0.0);
     const rw = new Array(LiquidEffect.MAX_GLASS_REGIONS).fill(0.0);
@@ -1968,34 +2141,34 @@ export const LiquidEffect = GObject.registerClass({
       rTintR[i] = region.tintR;
       rTintG[i] = region.tintG;
       rTintB[i] = region.tintB;
-      rBaseStrength[i] = Math.max(0.0, Math.min(1.0, region.baseStrength ?? 0.0));
+      rBaseStrength[i] = this._glassRegionsCache[i].baseStrength;
     });
 
-    this._setFloat('region_count', clamped.length);
-    this._setFloatArray('region_x', rx);
-    this._setFloatArray('region_y', ry);
-    this._setFloatArray('region_w', rw);
-    this._setFloatArray('region_h', rh);
-    this._setFloatArray('region_tint_r', rTintR);
-    this._setFloatArray('region_tint_g', rTintG);
-    this._setFloatArray('region_tint_b', rTintB);
-    this._setFloatArray('region_base_strength', rBaseStrength);
-    this.queue_repaint();
+    let changed = this._setFloat('region_count', clamped.length);
+    changed = this._setFloatArray('region_x', rx) || changed;
+    changed = this._setFloatArray('region_y', ry) || changed;
+    changed = this._setFloatArray('region_w', rw) || changed;
+    changed = this._setFloatArray('region_h', rh) || changed;
+    changed = this._setFloatArray('region_tint_r', rTintR) || changed;
+    changed = this._setFloatArray('region_tint_g', rTintG) || changed;
+    changed = this._setFloatArray('region_tint_b', rTintB) || changed;
+    changed = this._setFloatArray('region_base_strength', rBaseStrength) || changed;
+    if (changed) this.queue_repaint();
   }
 
   setBrightness(brightness: number): void {
-    this._setFloat('brightness', brightness);
-    this.queue_repaint();
+    if (this._setFloat('brightness', brightness))
+      this.queue_repaint();
   }
 
   setContrast(contrast: number): void {
-    this._setFloat('contrast', contrast);
-    this.queue_repaint();
+    if (this._setFloat('contrast', contrast))
+      this.queue_repaint();
   }
 
   setSaturation(saturation: number): void {
-    this._setFloat('saturation', saturation);
-    this.queue_repaint();
+    if (this._setFloat('saturation', saturation))
+      this.queue_repaint();
   }
 
   /**

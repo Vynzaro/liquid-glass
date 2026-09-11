@@ -395,9 +395,31 @@
     </key>
 
     <key name="blur-method" type="i">
+      <range min="0" max="1"/>
       <default>0</default>
       <summary>Blur method</summary>
       <description>0 = Gaussian Blur (Recommended), 1 = Dual Kawase (Performance)</description>
+    </key>
+
+    <key name="material-mode" type="i">
+      <range min="0" max="2"/>
+      <default>0</default>
+      <summary>Glass material</summary>
+      <description>0 = Liquid, 1 = Frosted, 2 = Hybrid</description>
+    </key>
+
+    <key name="frosted-strength" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>0.55</default>
+      <summary>Frosted diffusion strength</summary>
+      <description>Controls desaturation and the diffuse veil in Frosted and Hybrid materials.</description>
+    </key>
+
+    <key name="frosted-grain" type="d">
+      <range min="0.0" max="0.08"/>
+      <default>0.018</default>
+      <summary>Frosted grain strength</summary>
+      <description>Adds stable fine grain to Frosted and Hybrid materials without another blur pass.</description>
     </key>
 
     <key name="glass-max-z" type="d">

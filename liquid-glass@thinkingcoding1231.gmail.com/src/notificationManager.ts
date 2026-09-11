@@ -51,6 +51,8 @@ export class NotificationManager {
   private _signals: number[];
   private _settingsSignals: number[];
   private _frameSyncId: number;
+  private _bannerSetupIdleId: number;
+  private _bannerSetupActor: St.Widget | null;
   private _isEffectActive: boolean;
 
   private _stableBaseW: number | undefined;
@@ -84,6 +86,8 @@ export class NotificationManager {
     this._signals = [];
     this._settingsSignals = [];
     this._frameSyncId = 0;
+    this._bannerSetupIdleId = 0;
+    this._bannerSetupActor = null;
     this._isEffectActive = false;
 
     this._contrastSampler = new StageContrastSampler();
@@ -222,7 +226,14 @@ export class NotificationManager {
     this._signals.push(bannerBin.connect('child-added', (container, actor: St.Widget) => {
       if (actor === this.bgActor || actor.get_name?.() === 'liquid-glass-bg-actor') return;
 
-      GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+      if (this._bannerSetupIdleId)
+        GLib.Source.remove(this._bannerSetupIdleId);
+      this._bannerSetupActor = actor;
+      this._bannerSetupIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+        this._bannerSetupIdleId = 0;
+        this._bannerSetupActor = null;
+        if (!this._isEffectActive || actor.get_parent?.() !== bannerBin)
+          return GLib.SOURCE_REMOVE;
         // @ts-expect-error: _banner is an internal property
         let banner = this.tray._banner || actor;
         if (banner && banner !== this.currentBanner) {
@@ -236,6 +247,11 @@ export class NotificationManager {
 
     this._signals.push(bannerBin.connect('child-removed', (container, actor: St.Widget) => {
       if (actor === this.bgActor || actor.get_name?.() === 'liquid-glass-bg-actor') return;
+      if (this._bannerSetupIdleId && actor === this._bannerSetupActor) {
+        GLib.Source.remove(this._bannerSetupIdleId);
+        this._bannerSetupIdleId = 0;
+        this._bannerSetupActor = null;
+      }
       this._cleanupCurrentBanner();
     }));
 
@@ -568,6 +584,12 @@ export class NotificationManager {
       try { bannerBin.disconnect(sigId); } catch (e) { }
     }
     this._signals = [];
+
+    if (this._bannerSetupIdleId) {
+      GLib.Source.remove(this._bannerSetupIdleId);
+      this._bannerSetupIdleId = 0;
+    }
+    this._bannerSetupActor = null;
 
     this._cleanupCurrentBanner();
   }

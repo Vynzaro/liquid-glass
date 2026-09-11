@@ -84,6 +84,7 @@ export class UIManager {
 
   private _interfaceSettings: Gio.Settings | null = null;
   private _accentColorSignalId: number = 0;
+  private _accentColorTimeoutId: number = 0;
 
   private _dynamicCssFile: Gio.File | null = null;
   private _cornerRadius: number = 0;
@@ -159,21 +160,38 @@ export class UIManager {
     this._springScale.updateParams(this._springStiffness, this._springDamping, this._springMass);
     this._springPos.updateParams(this._springStiffness, this._springDamping, this._springMass);
 
+    if (this._settings.get_boolean('enable-menu-glass')) {
+      this._applyEffect();
+    }
+  }
+
+  private _startAccentTracking() {
+    if (this._interfaceSettings) return;
+
     this._interfaceSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.interface' });
     this._accentColorSignalId = this._interfaceSettings.connect('changed::accent-color', () => {
-      // console.log(`[Liquid Glass] System accent color changed.`);
-      GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+      if (this._accentColorTimeoutId)
+        GLib.Source.remove(this._accentColorTimeoutId);
+      this._accentColorTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+        this._accentColorTimeoutId = 0;
         this._applySystemAccentColor();
         return GLib.SOURCE_REMOVE;
       });
     });
 
-    // 初回実行
     this._applySystemAccentColor();
+  }
 
-    if (this._settings.get_boolean('enable-menu-glass')) {
-      this._applyEffect();
+  private _stopAccentTracking() {
+    if (this._accentColorTimeoutId) {
+      GLib.Source.remove(this._accentColorTimeoutId);
+      this._accentColorTimeoutId = 0;
     }
+    if (this._interfaceSettings && this._accentColorSignalId) {
+      try { this._interfaceSettings.disconnect(this._accentColorSignalId); } catch (e) { }
+      this._accentColorSignalId = 0;
+    }
+    this._interfaceSettings = null;
   }
 
   private _applySystemAccentColor() {
@@ -365,7 +383,11 @@ export class UIManager {
     if (this._isEffectActive) return;
     this._isEffectActive = true;
 
-    if (!this.targetActor) return;
+    if (!this.targetActor) {
+      this._isEffectActive = false;
+      return;
+    }
+    this._startAccentTracking();
 
     // Remove default GNOME styling and make the background transparent
     this.targetActor.add_style_class_name('liquid-glass-transparent');
@@ -1144,11 +1166,7 @@ export class UIManager {
       this._frameSyncId = 0;
     }
 
-    if (this._interfaceSettings && this._accentColorSignalId) {
-      this._interfaceSettings.disconnect(this._accentColorSignalId);
-      this._accentColorSignalId = 0;
-      this._interfaceSettings = null;
-    }
+    this._stopAccentTracking();
 
     // Remove transparent CSS overrides
     this.targetActor.remove_style_class_name('liquid-glass-transparent');
@@ -1211,8 +1229,16 @@ export class UIManager {
     }
     this._settingsSignals = [];
 
-    if (!this.targetActor) return;
     this._removeEffect();
+
+    // The open-state signal is connected in the constructor, independently
+    // from whether the visual effect is currently enabled.
+    if (this._animSignalId) {
+      try { this.menu.disconnect(this._animSignalId); } catch (e) { }
+      this._animSignalId = 0;
+    }
+
+    this._stopAccentTracking();
   }
 }
 

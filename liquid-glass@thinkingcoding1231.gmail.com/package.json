@@ -4,17 +4,12 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "watch": "tsc -w"
+    "watch": "tsc -w",
+    "test": "node --test ../tests/*.test.cjs",
+    "verify": "npm run build && npm test"
   },
   "devDependencies": {
     "@girs/gnome-shell": "^50.0.0",
     "typescript": "^6.0.3"
-  },
-  "dependencies": {
-    "@girs/clutter-17": "^17.0.0-4.0.0-rc.15",
-    "@girs/gio-2.0": "^2.88.0-4.0.0-rc.15",
-    "@girs/meta-17": "^17.0.0-4.0.0-rc.15",
-    "@girs/st-13": "^13.0.0-4.0.0-rc.15",
-    "@gtile/gjs": "^3.2.3"
   }
 }

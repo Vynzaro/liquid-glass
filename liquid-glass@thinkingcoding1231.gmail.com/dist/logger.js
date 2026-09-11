@@ -17,6 +17,9 @@ export class Logger {
             this._outputLogs = this._settings.get_boolean('output-logs');
         });
     }
+    get enabled() {
+        return this._outputLogs;
+    }
     log(...args) {
         if (!this._outputLogs)
             return;

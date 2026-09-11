@@ -41,8 +41,7 @@
   "include": [
     "src/*.ts",
     "src/*.js",
-    "global.d.ts",
-    "tests/uiManager-final.ts"
+    "global.d.ts"
   ],
   "exclude": [
     "node_modules",

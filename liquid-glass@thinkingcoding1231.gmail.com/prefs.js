@@ -436,6 +436,18 @@ export default class LiquidGlassPreferences extends ExtensionPreferences {
     const physGroup = new Adw.PreferencesGroup({ title: 'Physical &amp; Optical Properties' });
     shaderPage.add(physGroup);
 
+    const materialModeRow = new Adw.ComboRow({
+      title: 'Material',
+      subtitle: 'Frosted is the lightest composite; Hybrid keeps subtle refraction',
+      model: Gtk.StringList.new([
+        'Liquid Glass',
+        'Frosted Glass (Performance)',
+        'Hybrid Glass'
+      ])
+    });
+    this._addRowToContainer(physGroup, materialModeRow);
+    settings.bind('material-mode', materialModeRow, 'selected', Gio.SettingsBindFlags.DEFAULT);
+
     // Blur Method を選択する ComboRow を追加し、GSettingsにバインド
     const blurMethodRow = new Adw.ComboRow({
       title: 'Blur Method',
@@ -453,6 +465,23 @@ export default class LiquidGlassPreferences extends ExtensionPreferences {
     this._addSliderRow(physGroup, settings, 'glass-profile-shape-n', 'Profile Shape N', 'Curvature shape of the surface', 1.0, 20.0, 0.1);
     this._addSliderRow(physGroup, settings, 'glass-ior', 'Index of Refraction', 'Optical density (1.5 - 2.4)', 1.0, 4.0, 0.01);
     this._addSliderRow(physGroup, settings, 'glass-chroma-strength', 'Chroma Strength', 'RGB color separation', 0.0, 0.1, 0.001);
+
+    const frostedGroup = new Adw.PreferencesGroup({
+      title: 'Frosted Material',
+      description: 'Diffusion and stable surface grain. Reuses the selected blur method and adds no extra blur pass.'
+    });
+    shaderPage.add(frostedGroup);
+    this._addSliderRow(frostedGroup, settings, 'frosted-strength', 'Diffusion Strength', 'Desaturation and soft translucent veil', 0.0, 1.0, 0.01);
+    this._addSliderRow(frostedGroup, settings, 'frosted-grain', 'Fine Grain', 'Stable grain amount; excessive values reduce readability', 0.0, 0.08, 0.001);
+
+    const updateFrostedVisibility = () => {
+      frostedGroup.visible = settings.get_int('material-mode') !== 0;
+    };
+    const materialChangedId = settings.connect('changed::material-mode', updateFrostedVisibility);
+    window.connect('destroy', () => {
+      try { settings.disconnect(materialChangedId); } catch (e) { }
+    });
+    updateFrostedVisibility();
 
     const lightGroup = new Adw.PreferencesGroup({ title: 'Lighting &amp; Reflections' });
     shaderPage.add(lightGroup);

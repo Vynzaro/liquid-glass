@@ -23,6 +23,10 @@ export class Logger {
     });
   }
 
+  get enabled(): boolean {
+    return this._outputLogs;
+  }
+
   log(...args: any[]) {
     if (!this._outputLogs) return;
     console.log(...args);

@@ -47,6 +47,9 @@ export class ApplicationManager {
     _windowCreatedId;
     _restackedId = 0;
     _rebuildQueued = false;
+    _rebuildIdleId = 0;
+    _pendingFirstFrameSignals = new Map();
+    _disposed = false;
     // ── Diagnostics for the focus-change "shifted texture" issue ───────────────
     // When > 0, _syncState() logs, for every tracked window, the raw actor
     // position vs. Meta's own frame/buffer rects, plus (for every "window
@@ -91,6 +94,7 @@ export class ApplicationManager {
         this._restackedId = 0;
     }
     setup() {
+        this._disposed = false;
         this._logger.log("[Liquid Glass] ApplicationManager setup starting...");
         this._bindSettings();
         this._windowCreatedId = global.display.connect('window-created', (_d, metaWindow) => {
@@ -105,13 +109,21 @@ export class ApplicationManager {
                 return;
             }
             this._logger.log("[Liquid Glass] window compositor actor found. Connecting to first-frame.");
-            obj.connect('first-frame', () => {
+            const firstFrameId = obj.connect('first-frame', () => {
+                try {
+                    obj.disconnect(firstFrameId);
+                }
+                catch (e) { }
+                this._pendingFirstFrameSignals.delete(obj);
+                if (this._disposed)
+                    return;
                 this._logger.log("[Liquid Glass] first-frame event fired for window: " + metaWindow.get_title());
                 if (this._shouldApplyToWindow(obj)) {
                     this._setupWindow(obj);
                     this._rebuildAllClones();
                 }
             });
+            this._pendingFirstFrameSignals.set(obj, firstFrameId);
         });
         this._restackedId = global.display.connect('restacked', () => {
             this._rebuildAllClones();
@@ -136,6 +148,7 @@ export class ApplicationManager {
             this._applyEffects();
     }
     cleanup() {
+        this._disposed = true;
         if (this._windowCreatedId) {
             global.display.disconnect(this._windowCreatedId);
             this._windowCreatedId = 0;
@@ -152,6 +165,13 @@ export class ApplicationManager {
         }
         this._debugArmSignals = [];
         this._displacedContainers.clear();
+        for (const [actor, id] of this._pendingFirstFrameSignals) {
+            try {
+                actor.disconnect(id);
+            }
+            catch (e) { }
+        }
+        this._pendingFirstFrameSignals.clear();
         this._settingsSignals.forEach(id => this._settings.disconnect(id));
         this._settingsSignals = [];
         this._removeAllEffects();
@@ -292,6 +312,10 @@ export class ApplicationManager {
             }
             this._rebuildFollowupLaterId = 0;
         }
+        if (this._rebuildIdleId) {
+            GLib.Source.remove(this._rebuildIdleId);
+            this._rebuildIdleId = 0;
+        }
         for (let state of this._states.values())
             this._cleanupState(state);
         this._states.clear();
@@ -369,7 +393,8 @@ export class ApplicationManager {
             return;
         this._rebuildQueued = true;
         // Debounce to next idle to avoid crashing during rapid restacking/creation
-        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+        this._rebuildIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._rebuildIdleId = 0;
             if (this._states.size === 0) {
                 this._rebuildQueued = false;
                 return GLib.SOURCE_REMOVE;
@@ -705,7 +730,7 @@ export class ApplicationManager {
         state.baseClones.forEach(clone => clone.destroy());
         state.baseClones.clear();
         state.baseWindowsContainer.remove_all_children();
-        const debugLog = this._debugFocusLogFrames > 0;
+        const debugLog = this._logger.enabled && this._debugFocusLogFrames > 0;
         if (debugLog) {
             const titles = getWindowActors().map((a) => {
                 const mw = typeof a.get_meta_window === 'function' ? a.get_meta_window() : null;
@@ -878,16 +903,31 @@ export class ApplicationManager {
     // `dx`/`dy` are the desired screen origin RELATIVE TO A, in screen pixels.
     _applyCounterScale(child, windowActor, dx, dy, w, h) {
         const [sx, sy] = this._animationScale(windowActor);
-        child.set_pivot_point(0, 0);
-        child.remove_clip();
-        child.set_size(w, h);
+        const [pivotX, pivotY] = child.get_pivot_point();
+        if (pivotX !== 0 || pivotY !== 0)
+            child.set_pivot_point(0, 0);
+        try {
+            if (child.has_clip)
+                child.remove_clip();
+        }
+        catch (e) { }
+        if (child.width !== w || child.height !== h)
+            child.set_size(w, h);
         if (sx === 1 && sy === 1) {
-            child.set_scale(1, 1);
-            child.set_position(dx, dy);
+            if (child.scale_x !== 1 || child.scale_y !== 1)
+                child.set_scale(1, 1);
+            if (child.x !== dx || child.y !== dy)
+                child.set_position(dx, dy);
             return;
         }
-        child.set_scale(1 / sx, 1 / sy);
-        child.set_position(dx / sx, dy / sy);
+        const childScaleX = 1 / sx;
+        const childScaleY = 1 / sy;
+        const childX = dx / sx;
+        const childY = dy / sy;
+        if (child.scale_x !== childScaleX || child.scale_y !== childScaleY)
+            child.set_scale(childScaleX, childScaleY);
+        if (child.x !== childX || child.y !== childY)
+            child.set_position(childX, childY);
     }
     // windowActor's own animation scale, sanitised. Split out so the geometry
     // in _syncStateInner() and the placement above can never disagree about
@@ -965,7 +1005,7 @@ export class ApplicationManager {
             setActorVisible(state.cornerOverlay, false);
             return;
         }
-        if (this._debugFocusLogFrames > 0)
+        if (this._logger.enabled && this._debugFocusLogFrames > 0)
             this._logFocusDebugInfo(state);
         const rect = metaWin.get_frame_rect();
         const bufferRect = metaWin.get_buffer_rect();
@@ -1028,11 +1068,15 @@ export class ApplicationManager {
         const localX = frameDX - SHADER_PADDING;
         const localY = frameDY - SHADER_PADDING;
         this._applyCounterScale(state.bgActor, actor, localX, localY, bgW, bgH);
-        state.clipBox.set_position(0, 0);
-        state.clipBox.set_size(bgW, bgH);
+        if (state.clipBox.x !== 0 || state.clipBox.y !== 0)
+            state.clipBox.set_position(0, 0);
+        if (state.clipBox.width !== bgW || state.clipBox.height !== bgH)
+            state.clipBox.set_size(bgW, bgH);
         // Give containers a real, non-zero size matching their clipping bounds
-        state.windowsContainer.set_size(bgW, bgH);
-        state.baseWindowsContainer.set_size(baseActorW, baseActorH);
+        if (state.windowsContainer.width !== bgW || state.windowsContainer.height !== bgH)
+            state.windowsContainer.set_size(bgW, bgH);
+        if (state.baseWindowsContainer.width !== baseActorW || state.baseWindowsContainer.height !== baseActorH)
+            state.baseWindowsContainer.set_size(baseActorW, baseActorH);
         // Update shader resolution/geometry. These get the LIVE size too —
         // handing them the final size is what kept the rounded corners and the
         // edge refraction laid out for the maximized window during the whole
@@ -1111,11 +1155,16 @@ export class ApplicationManager {
                 // 実際のプロパティ(x,y)は0,0に固定し、描画オフセットのみで配置する
                 if (clone.x !== 0 || clone.y !== 0)
                     clone.set_position(0, 0);
-                clone.translation_x = src.x;
-                clone.translation_y = src.y;
-                clone.set_size(src.width, src.height);
-                clone.set_scale(src.scale_x, src.scale_y);
-                clone.opacity = src.opacity;
+                if (clone.translation_x !== src.x)
+                    clone.translation_x = src.x;
+                if (clone.translation_y !== src.y)
+                    clone.translation_y = src.y;
+                if (clone.width !== src.width || clone.height !== src.height)
+                    clone.set_size(src.width, src.height);
+                if (clone.scale_x !== src.scale_x || clone.scale_y !== src.scale_y)
+                    clone.set_scale(src.scale_x, src.scale_y);
+                if (clone.opacity !== src.opacity)
+                    clone.opacity = src.opacity;
                 this._checkCloneAnomaly(clone, src, 'blurred');
             }
         }
@@ -1131,11 +1180,16 @@ export class ApplicationManager {
                 setActorVisible(clone, true);
                 if (clone.x !== 0 || clone.y !== 0)
                     clone.set_position(0, 0);
-                clone.translation_x = src.x;
-                clone.translation_y = src.y;
-                clone.set_size(src.width, src.height);
-                clone.set_scale(src.scale_x, src.scale_y);
-                clone.opacity = src.opacity;
+                if (clone.translation_x !== src.x)
+                    clone.translation_x = src.x;
+                if (clone.translation_y !== src.y)
+                    clone.translation_y = src.y;
+                if (clone.width !== src.width || clone.height !== src.height)
+                    clone.set_size(src.width, src.height);
+                if (clone.scale_x !== src.scale_x || clone.scale_y !== src.scale_y)
+                    clone.set_scale(src.scale_x, src.scale_y);
+                if (clone.opacity !== src.opacity)
+                    clone.opacity = src.opacity;
                 this._checkCloneAnomaly(clone, src, 'base');
             }
         }
@@ -1144,8 +1198,10 @@ export class ApplicationManager {
         const baseW = visW + (SHADER_PADDING * 2);
         const baseH = visH + (SHADER_PADDING * 2);
         this._applyCounterScale(state.cornerOverlay, actor, frameDX - SHADER_PADDING, frameDY - SHADER_PADDING, baseW, baseH);
-        state.cornerOverlayClone.set_position(0, 0);
-        state.cornerOverlayClone.set_size(baseW, baseH);
+        if (state.cornerOverlayClone.x !== 0 || state.cornerOverlayClone.y !== 0)
+            state.cornerOverlayClone.set_position(0, 0);
+        if (state.cornerOverlayClone.width !== baseW || state.cornerOverlayClone.height !== baseH)
+            state.cornerOverlayClone.set_size(baseW, baseH);
         // [FIX] Last line of defence, applied after every setActorVisible(…, true)
         // above so it wins. If the clone containers are anchored hundreds of
         // pixels away from screen (0,0), this glass cannot draw anything but
@@ -1171,6 +1227,8 @@ export class ApplicationManager {
     // would just spam false positives every frame. `mapped` and a
     // degenerate/zero size are the only checks that don't have that problem.
     _checkCloneAnomaly(clone, src, kind) {
+        if (!this._logger.enabled)
+            return;
         let mapped = true, w = -1, h = -1;
         try {
             mapped = clone.mapped;
@@ -1250,14 +1308,14 @@ export class ApplicationManager {
                 ensureGlassAllocated(state.baseActor);
                 ensureGlassAllocated(state.cornerOverlay);
                 this._syncState(state);
-                if (this._debugFocusLogFrames > 0)
+                if (this._logger.enabled && this._debugFocusLogFrames > 0)
                     this._logFocusDebugInfo(state);
             }
             catch (e) {
                 this._logger.error(`[Liquid Glass] Error in _syncState: ${e}`);
             }
         }
-        if (this._debugFocusLogFrames > 0)
+        if (this._logger.enabled && this._debugFocusLogFrames > 0)
             this._debugFocusLogFrames--;
         this._frameSyncId = global.compositor.get_laters().add(Meta.LaterType.BEFORE_REDRAW, () => {
             this._frameTick();
@@ -1275,6 +1333,10 @@ export class ApplicationManager {
     // whether that assumption itself ever diverges) and the position that
     // will actually be applied to the clone this frame.
     _armFocusDebug(reason) {
+        if (!this._logger.enabled) {
+            this._debugFocusLogFrames = 0;
+            return;
+        }
         this._debugFocusLogFrames = ApplicationManager.DEBUG_FOCUS_LOG_FRAME_COUNT;
         this._logger.log(`[Liquid Glass][focus-debug] ---- ${reason} event ----`);
     }

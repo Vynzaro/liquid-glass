@@ -5,10 +5,12 @@
 
 A GNOME Shell Extension that replicates the "Liquid Glass" UI concept using shaders on your desktop.
 
-> [!NOTE]
-> **Disclaimer:** This is an unofficial, community-driven fan project and is not affiliated with, endorsed by, or connected to Apple Inc. in any way.
+This performance-focused fork of [ryohsuke1231/liquid-glass](https://github.com/ryohsuke1231/liquid-glass) reduces avoidable work in the render loop and adds **Frosted** and **Hybrid** material modes alongside the original liquid-glass look.
 
-I love the look of Apple's Liquid Glass, but since I don't own any Apple products (I use an Android smartphone and a Linux computer), I wanted a way to see it on my desktop every day. So, I decided to build it myself.
+> [!NOTE]
+> **Disclaimer:** This is an unofficial, community-driven fan project and is not affiliated with, endorsed by, or connected to Apple Inc. in any way. This fork keeps the upstream extension UUID, so installing it replaces another installed copy that uses the same UUID.
+
+The original extension and shader were created by [Ryohsuke](https://github.com/ryohsuke1231). This fork retains that work and focuses on lower overhead, predictable lifecycle cleanup and an optional frosted-glass rendering path.
 
 ## Demo
 
@@ -50,19 +52,19 @@ OSD:
 ## Installation (GNOME Extension)
 
 > [!IMPORTANT]
-> This extension is **not yet available on [extensions.gnome.org](https://extensions.gnome.org)**. It has been submitted, but is still unreviewed, so for now it has to be installed manually using one of the methods below.
+> This fork is **not available on [extensions.gnome.org](https://extensions.gnome.org)**, so it has to be installed manually using one of the methods below.
 
 ### Option 1: Quick Install (Terminal)
 Copy and paste this one-liner to clone and install it immediately:
 
 ```bash
-git clone https://github.com/ryohsuke1231/liquid-glass.git && \
+git clone https://github.com/Vynzaro/liquid-glass.git && \
 mkdir -p ~/.local/share/gnome-shell/extensions/ && \
 cp -r liquid-glass/liquid-glass@thinkingcoding1231.gmail.com ~/.local/share/gnome-shell/extensions/
 ```
 
 ### Option 2: Manual Install
-1. Clone this repository: `git clone https://github.com/ryohsuke1231/liquid-glass.git`
+1. Clone this repository: `git clone https://github.com/Vynzaro/liquid-glass.git`
 2. Open the `liquid-glass` folder.
 3. Copy the **entire `liquid-glass@thinkingcoding1231.gmail.com` folder** to:
    `~/.local/share/gnome-shell/extensions/`
@@ -99,8 +101,14 @@ Where it is supported, the extension samples the brightness of what is behind th
 
 The **Glass** page in the preferences window controls the shader itself. These settings are global and apply to every element above at once.
 
+### Material
+- **Liquid Glass** preserves the full refraction, chromatic aberration and surface-lighting path.
+- **Frosted Glass (Performance)** uses one blurred-background sample and skips refraction and chromatic aberration. It is the lowest-cost material mode.
+- **Hybrid Glass** keeps restrained refraction while using the cheaper frosted sampling path.
+- **Frosted Strength** controls diffusion and desaturation; **Frosted Grain** adds a subtle, stable texture. These controls appear for Frosted and Hybrid modes.
+
 ### Physical & Optical Properties
-- **Blur Method** - `Gaussian Blur` (recommended, most accurate) or `Dual Kawase` (cheaper, better performance; the radius is not pixel-accurate).
+- **Blur Method** - `Gaussian Blur` offers the most accurate radius; `Dual Kawase` is cheaper and recommended when performance matters, especially with Frosted or Hybrid material.
 - **Maximum Z Depth** - The simulated physical thickness of the glass. Higher values bend the background more strongly near the edges.
 - **Displacement Scale** - The overall strength of the refraction distortion.
 - **Edge Smoothing** - Feathering width of the glass silhouette, used as geometry anti-aliasing.
@@ -151,11 +159,11 @@ This project is written in TypeScript and compiled to GJS. To build it:
 
 ```bash
 cd liquid-glass@thinkingcoding1231.gmail.com
-npm install
-npm run build
+npm ci
+npm run verify
 ```
 
-A significant part of this codebase was written with the help of AI coding assistants, primarily **Claude (Anthropic)**, used for implementation, shader debugging, and refactoring. The design, the shader math, the architecture decisions, and all of the testing on real hardware are mine, and every change is reviewed before it lands.
+A significant part of the upstream codebase was written with the help of AI coding assistants, primarily **Claude (Anthropic)**. See the upstream repository for its original design and implementation history. Fork-specific changes are checked by the TypeScript build, schema compiler and test suite; they should also be exercised in a GNOME Shell session before a release is tagged.
 
 
 ## Roadmap
@@ -170,7 +178,8 @@ A significant part of this codebase was written with the help of AI coding assis
 - [x] Add OSD support
 - [x] Add Quick Settings Toggle mode (per-toggle glass)
 - [x] Add Application Window support (originally by [@hoshizora-chi](https://github.com/hoshizora-chi))
-- [ ] Improve performance
+- [x] Reduce avoidable per-frame work and add a low-cost Frosted material
+- [ ] Share background capture work across application-window effects
 - [ ] Publish to extensions.gnome.org (not approved yet)
 
 

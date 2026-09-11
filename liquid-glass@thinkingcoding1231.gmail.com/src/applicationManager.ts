@@ -100,6 +100,9 @@ export class ApplicationManager {
   private _windowCreatedId: number;
   private _restackedId: number = 0;
   private _rebuildQueued: boolean = false;
+  private _rebuildIdleId: number = 0;
+  private _pendingFirstFrameSignals: Map<Meta.WindowActor, number> = new Map();
+  private _disposed: boolean = false;
 
 
   // ── Diagnostics for the focus-change "shifted texture" issue ───────────────
@@ -150,6 +153,7 @@ export class ApplicationManager {
   }
 
   setup() {
+    this._disposed = false;
     this._logger.log("[Liquid Glass] ApplicationManager setup starting...");
     this._bindSettings();
 
@@ -165,13 +169,17 @@ export class ApplicationManager {
         return;
       }
       this._logger.log("[Liquid Glass] window compositor actor found. Connecting to first-frame.");
-      obj.connect('first-frame', () => {
+      const firstFrameId = obj.connect('first-frame', () => {
+        try { obj.disconnect(firstFrameId); } catch (e) { }
+        this._pendingFirstFrameSignals.delete(obj);
+        if (this._disposed) return;
         this._logger.log("[Liquid Glass] first-frame event fired for window: " + metaWindow.get_title());
         if (this._shouldApplyToWindow(obj)) {
           this._setupWindow(obj);
           this._rebuildAllClones();
         }
       });
+      this._pendingFirstFrameSignals.set(obj, firstFrameId);
     });
 
     this._restackedId = global.display.connect('restacked', () => {
@@ -199,6 +207,7 @@ export class ApplicationManager {
   }
 
   cleanup() {
+    this._disposed = true;
     if (this._windowCreatedId) {
       global.display.disconnect(this._windowCreatedId);
       this._windowCreatedId = 0;
@@ -214,6 +223,11 @@ export class ApplicationManager {
     }
     this._debugArmSignals = [];
     this._displacedContainers.clear();
+
+    for (const [actor, id] of this._pendingFirstFrameSignals) {
+      try { actor.disconnect(id); } catch (e) { }
+    }
+    this._pendingFirstFrameSignals.clear();
 
     this._settingsSignals.forEach(id => this._settings.disconnect(id));
     this._settingsSignals = [];
@@ -376,6 +390,11 @@ export class ApplicationManager {
       this._rebuildFollowupLaterId = 0;
     }
 
+    if (this._rebuildIdleId) {
+      GLib.Source.remove(this._rebuildIdleId);
+      this._rebuildIdleId = 0;
+    }
+
     for (let state of this._states.values())
       this._cleanupState(state);
 
@@ -463,7 +482,8 @@ export class ApplicationManager {
     this._rebuildQueued = true;
 
     // Debounce to next idle to avoid crashing during rapid restacking/creation
-    GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+    this._rebuildIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+      this._rebuildIdleId = 0;
       if (this._states.size === 0) {
         this._rebuildQueued = false;
         return GLib.SOURCE_REMOVE;
@@ -834,7 +854,7 @@ export class ApplicationManager {
     state.baseClones.clear();
     state.baseWindowsContainer.remove_all_children();
 
-    const debugLog = this._debugFocusLogFrames > 0;
+    const debugLog = this._logger.enabled && this._debugFocusLogFrames > 0;
     if (debugLog) {
       const titles = getWindowActors().map((a: any) => {
         const mw = typeof a.get_meta_window === 'function' ? a.get_meta_window() : null;
@@ -1026,18 +1046,27 @@ export class ApplicationManager {
   ): void {
     const [sx, sy] = this._animationScale(windowActor);
 
-    child.set_pivot_point(0, 0);
-    child.remove_clip();
-    child.set_size(w, h);
+    const [pivotX, pivotY] = child.get_pivot_point();
+    if (pivotX !== 0 || pivotY !== 0) child.set_pivot_point(0, 0);
+    try {
+      if (child.has_clip) child.remove_clip();
+    } catch (e) { }
+    if (child.width !== w || child.height !== h) child.set_size(w, h);
 
     if (sx === 1 && sy === 1) {
-      child.set_scale(1, 1);
-      child.set_position(dx, dy);
+      if (child.scale_x !== 1 || child.scale_y !== 1) child.set_scale(1, 1);
+      if (child.x !== dx || child.y !== dy) child.set_position(dx, dy);
       return;
     }
 
-    child.set_scale(1 / sx, 1 / sy);
-    child.set_position(dx / sx, dy / sy);
+    const childScaleX = 1 / sx;
+    const childScaleY = 1 / sy;
+    const childX = dx / sx;
+    const childY = dy / sy;
+    if (child.scale_x !== childScaleX || child.scale_y !== childScaleY)
+      child.set_scale(childScaleX, childScaleY);
+    if (child.x !== childX || child.y !== childY)
+      child.set_position(childX, childY);
   }
 
   // windowActor's own animation scale, sanitised. Split out so the geometry
@@ -1120,7 +1149,8 @@ export class ApplicationManager {
       return;
     }
 
-    if (this._debugFocusLogFrames > 0) this._logFocusDebugInfo(state);
+    if (this._logger.enabled && this._debugFocusLogFrames > 0)
+      this._logFocusDebugInfo(state);
 
     const rect = metaWin.get_frame_rect();
     const bufferRect = metaWin.get_buffer_rect();
@@ -1192,12 +1222,16 @@ export class ApplicationManager {
 
     this._applyCounterScale(state.bgActor, actor, localX, localY, bgW, bgH);
 
-    state.clipBox.set_position(0, 0);
-    state.clipBox.set_size(bgW, bgH);
+    if (state.clipBox.x !== 0 || state.clipBox.y !== 0)
+      state.clipBox.set_position(0, 0);
+    if (state.clipBox.width !== bgW || state.clipBox.height !== bgH)
+      state.clipBox.set_size(bgW, bgH);
 
     // Give containers a real, non-zero size matching their clipping bounds
-    state.windowsContainer.set_size(bgW, bgH);
-    state.baseWindowsContainer.set_size(baseActorW, baseActorH);
+    if (state.windowsContainer.width !== bgW || state.windowsContainer.height !== bgH)
+      state.windowsContainer.set_size(bgW, bgH);
+    if (state.baseWindowsContainer.width !== baseActorW || state.baseWindowsContainer.height !== baseActorH)
+      state.baseWindowsContainer.set_size(baseActorW, baseActorH);
 
     // Update shader resolution/geometry. These get the LIVE size too —
     // handing them the final size is what kept the rounded corners and the
@@ -1283,12 +1317,14 @@ export class ApplicationManager {
 
         // 実際のプロパティ(x,y)は0,0に固定し、描画オフセットのみで配置する
         if (clone.x !== 0 || clone.y !== 0) clone.set_position(0, 0);
-        clone.translation_x = src.x;
-        clone.translation_y = src.y;
+        if (clone.translation_x !== src.x) clone.translation_x = src.x;
+        if (clone.translation_y !== src.y) clone.translation_y = src.y;
 
-        clone.set_size(src.width, src.height);
-        clone.set_scale(src.scale_x, src.scale_y);
-        clone.opacity = src.opacity;
+        if (clone.width !== src.width || clone.height !== src.height)
+          clone.set_size(src.width, src.height);
+        if (clone.scale_x !== src.scale_x || clone.scale_y !== src.scale_y)
+          clone.set_scale(src.scale_x, src.scale_y);
+        if (clone.opacity !== src.opacity) clone.opacity = src.opacity;
 
         this._checkCloneAnomaly(clone, src, 'blurred');
       }
@@ -1305,12 +1341,14 @@ export class ApplicationManager {
         setActorVisible(clone, true);
 
         if (clone.x !== 0 || clone.y !== 0) clone.set_position(0, 0);
-        clone.translation_x = src.x;
-        clone.translation_y = src.y;
+        if (clone.translation_x !== src.x) clone.translation_x = src.x;
+        if (clone.translation_y !== src.y) clone.translation_y = src.y;
 
-        clone.set_size(src.width, src.height);
-        clone.set_scale(src.scale_x, src.scale_y);
-        clone.opacity = src.opacity;
+        if (clone.width !== src.width || clone.height !== src.height)
+          clone.set_size(src.width, src.height);
+        if (clone.scale_x !== src.scale_x || clone.scale_y !== src.scale_y)
+          clone.set_scale(src.scale_x, src.scale_y);
+        if (clone.opacity !== src.opacity) clone.opacity = src.opacity;
 
         this._checkCloneAnomaly(clone, src, 'base');
       }
@@ -1324,8 +1362,10 @@ export class ApplicationManager {
 
     this._applyCounterScale(state.cornerOverlay, actor, frameDX - SHADER_PADDING, frameDY - SHADER_PADDING, baseW, baseH);
 
-    state.cornerOverlayClone.set_position(0, 0);
-    state.cornerOverlayClone.set_size(baseW, baseH);
+    if (state.cornerOverlayClone.x !== 0 || state.cornerOverlayClone.y !== 0)
+      state.cornerOverlayClone.set_position(0, 0);
+    if (state.cornerOverlayClone.width !== baseW || state.cornerOverlayClone.height !== baseH)
+      state.cornerOverlayClone.set_size(baseW, baseH);
 
     // [FIX] Last line of defence, applied after every setActorVisible(…, true)
     // above so it wins. If the clone containers are anchored hundreds of
@@ -1352,6 +1392,8 @@ export class ApplicationManager {
   // would just spam false positives every frame. `mapped` and a
   // degenerate/zero size are the only checks that don't have that problem.
   _checkCloneAnomaly(clone: Clutter.Actor, src: Meta.WindowActor, kind: string): void {
+    if (!this._logger.enabled) return;
+
     let mapped = true, w = -1, h = -1;
     try { mapped = clone.mapped; } catch (e) { }
     try { [w, h] = clone.get_size(); } catch (e) { }
@@ -1432,13 +1474,15 @@ export class ApplicationManager {
         ensureGlassAllocated(state.cornerOverlay);
         this._syncState(state);
 
-        if (this._debugFocusLogFrames > 0) this._logFocusDebugInfo(state);
+        if (this._logger.enabled && this._debugFocusLogFrames > 0)
+          this._logFocusDebugInfo(state);
       } catch (e) {
         this._logger.error(`[Liquid Glass] Error in _syncState: ${e}`);
       }
     }
 
-    if (this._debugFocusLogFrames > 0) this._debugFocusLogFrames--;
+    if (this._logger.enabled && this._debugFocusLogFrames > 0)
+      this._debugFocusLogFrames--;
 
     this._frameSyncId = global.compositor.get_laters().add(
       Meta.LaterType.BEFORE_REDRAW,
@@ -1460,6 +1504,10 @@ export class ApplicationManager {
   // whether that assumption itself ever diverges) and the position that
   // will actually be applied to the clone this frame.
   _armFocusDebug(reason: string) {
+    if (!this._logger.enabled) {
+      this._debugFocusLogFrames = 0;
+      return;
+    }
     this._debugFocusLogFrames = ApplicationManager.DEBUG_FOCUS_LOG_FRAME_COUNT;
     this._logger.log(`[Liquid Glass][focus-debug] ---- ${reason} event ----`);
   }

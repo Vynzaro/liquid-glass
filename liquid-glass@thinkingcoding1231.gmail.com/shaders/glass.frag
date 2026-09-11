@@ -63,6 +63,12 @@ uniform float isDock;
 // skipping the outer drop-shadow computation entirely.
 uniform float fast_mode;
 
+// Material model: 0 = Liquid, 1 = Frosted, 2 = Hybrid. All modes reuse the
+// same blurred layer; Frosted is intentionally the cheapest composite path.
+uniform float material_mode;
+uniform float frosted_strength;
+uniform float frosted_grain;
+
 // [NEW] SCB (Saturation, Contrast, Brightness) 調整用の変数
 uniform float brightness;
 uniform float contrast;
@@ -355,6 +361,13 @@ vec3 applySCB(vec3 color, float b, float c, float s) {
     return max(color, 0.0);
 }
 
+// Stable, screen-space interleaved gradient noise. This costs no texture
+// binding and avoids temporal shimmer because it depends only on pixel
+// position, not on frame time.
+float frostNoise(vec2 pixel) {
+    return fract(52.9829189 * fract(dot(floor(pixel), vec2(0.06711056, 0.00583715))));
+}
+
 void main() {
     vec2 resolution = vec2(resolution_x, resolution_y);
     vec2 uv = cogl_tex_coord_in[0].st;
@@ -631,68 +644,97 @@ void main() {
     //    pure black" look.
     vec3 shadowColor = vec3(0.03, 0.04, 0.08);
 
-    vec4 source = texture2D(cogl_sampler1, uv);
+    bool isFrosted = material_mode > 0.5 && material_mode < 1.5;
+    bool isHybrid = material_mode >= 1.5;
 
-    vec2 gradH = (fast_mode > 0.5)
-        ? heightGradientFast(local_pos, box_size, corner_radius, max_z, resolution)
-        : heightGradient(local_pos, box_size, corner_radius, max_z, resolution);
+    // Frosted glass deliberately avoids height-field evaluation, Snell
+    // refraction, chromatic separation and RGSS. It reads the already-blurred
+    // texture once and keeps a flat normal for the inexpensive edge lighting.
+    vec2 gradH = vec2(0.0);
+    if (!isFrosted) {
+        gradH = (fast_mode > 0.5 || isHybrid)
+            ? heightGradientFast(local_pos, box_size, corner_radius, max_z, resolution)
+            : heightGradient(local_pos, box_size, corner_radius, max_z, resolution);
+    }
     vec3 normal = getNormal(gradH);
 
-    vec2 disp = getDisplacement(d, normal, resolution);
+    vec3 refractedRgb;
+    if (isFrosted) {
+        refractedRgb = texture2D(cogl_sampler1, uv).rgb;
+    } else {
+        vec2 disp = getDisplacement(d, normal, resolution);
 
-    // Dampen the refraction near the exact boundaries to eliminate jagged artifacts.
-    float edgeDampen = smoothstep(0.0, edgeFeather * 3.0, -d);
-    disp *= edgeDampen;
+        // Dampen the refraction near the exact boundaries to eliminate jagged artifacts.
+        float edgeDampen = smoothstep(0.0, edgeFeather * 3.0, -d);
+        disp *= edgeDampen;
+        if (isHybrid) disp *= 0.35;
 
-    vec2 refractedUv = stabilizedUV(uv + disp, uv);
+        vec2 refractedUv = stabilizedUV(uv + disp, uv);
+        vec2 margin = vec2(1.2) / resolution;
 
-    float minRes = max(min(resolution.x, resolution.y), 1.0);
-    vec2 chromaDir = length(disp) > 0.00001 ? normalize(disp) : vec2(0.0);
-    
-    // Calculate Chromatic Aberration vectors (separating RGB channels slightly).
-    vec2 chromaVec = chromaDir * (chroma_strength / minRes) * edgeDampen;
-    vec2 uvR = stabilizedUV(refractedUv + chromaVec, refractedUv);
-    vec2 uvG = refractedUv;
-    vec2 uvB = stabilizedUV(refractedUv - chromaVec, refractedUv);
+        // Hybrid keeps subtle refraction but intentionally skips chromatic
+        // separation and four-sample RGSS. The blurred input already removes
+        // the high-frequency aliasing that those taps primarily defend against.
+        if (isHybrid) {
+            refractedRgb = texture2D(cogl_sampler1,
+                clamp(refractedUv, margin, 1.0 - margin)).rgb;
+        } else {
+            float minRes = max(min(resolution.x, resolution.y), 1.0);
+            vec2 chromaDir = length(disp) > 0.00001 ? normalize(disp) : vec2(0.0);
+            vec2 chromaVec = chromaDir * (chroma_strength / minRes) * edgeDampen;
+            vec2 uvR = stabilizedUV(refractedUv + chromaVec, refractedUv);
+            vec2 uvB = stabilizedUV(refractedUv - chromaVec, refractedUv);
 
-    // Step 1: RGSS (Rotated Grid Super-Sampling) Pattern Implementation
-    // Instead of sampling in a simple square, sampling in a slanted diamond pattern
-    // provides significantly better anti-aliasing for both horizontal and vertical edges.
-    float edgeProximity = 1.0 - smoothstep(0.0, edgeFeather * 4.0, -d);
-    float aa_spread = mix(0.75, 2.5, edgeProximity);
-    vec2 texel = vec2(aa_spread) / resolution;
+            float edgeProximity = 1.0 - smoothstep(0.0, edgeFeather * 4.0, -d);
+            float aa_spread = mix(0.75, 2.5, edgeProximity);
+            vec2 texel = vec2(aa_spread) / resolution;
+            vec2 off1 = vec2( 0.375, -0.125) * texel;
+            vec2 off2 = vec2( 0.125,  0.375) * texel;
+            vec2 off3 = vec2(-0.375,  0.125) * texel;
+            vec2 off4 = vec2(-0.125, -0.375) * texel;
 
-    vec2 off1 = vec2( 0.375, -0.125) * texel;
-    vec2 off2 = vec2( 0.125,  0.375) * texel;
-    vec2 off3 = vec2(-0.375,  0.125) * texel;
-    vec2 off4 = vec2(-0.125, -0.375) * texel;
+            // With chromatic aberration disabled, fetch each RGSS position
+            // once as RGB instead of issuing twelve per-channel texture reads.
+            if (chroma_strength <= 0.000001) {
+                refractedRgb = (
+                    texture2D(cogl_sampler1, clamp(refractedUv + off1, margin, 1.0 - margin)).rgb +
+                    texture2D(cogl_sampler1, clamp(refractedUv + off2, margin, 1.0 - margin)).rgb +
+                    texture2D(cogl_sampler1, clamp(refractedUv + off3, margin, 1.0 - margin)).rgb +
+                    texture2D(cogl_sampler1, clamp(refractedUv + off4, margin, 1.0 - margin)).rgb
+                ) * 0.25;
+            } else {
+                refractedRgb = vec3(
+                    (texture2D(cogl_sampler1, clamp(uvR + off1, margin, 1.0 - margin)).r +
+                     texture2D(cogl_sampler1, clamp(uvR + off2, margin, 1.0 - margin)).r +
+                     texture2D(cogl_sampler1, clamp(uvR + off3, margin, 1.0 - margin)).r +
+                     texture2D(cogl_sampler1, clamp(uvR + off4, margin, 1.0 - margin)).r) * 0.25,
+                    (texture2D(cogl_sampler1, clamp(refractedUv + off1, margin, 1.0 - margin)).g +
+                     texture2D(cogl_sampler1, clamp(refractedUv + off2, margin, 1.0 - margin)).g +
+                     texture2D(cogl_sampler1, clamp(refractedUv + off3, margin, 1.0 - margin)).g +
+                     texture2D(cogl_sampler1, clamp(refractedUv + off4, margin, 1.0 - margin)).g) * 0.25,
+                    (texture2D(cogl_sampler1, clamp(uvB + off1, margin, 1.0 - margin)).b +
+                     texture2D(cogl_sampler1, clamp(uvB + off2, margin, 1.0 - margin)).b +
+                     texture2D(cogl_sampler1, clamp(uvB + off3, margin, 1.0 - margin)).b +
+                     texture2D(cogl_sampler1, clamp(uvB + off4, margin, 1.0 - margin)).b) * 0.25
+                );
+            }
+        }
+    }
 
-    // Hard limit sampling coordinates to 1.2px inside the texture bounds.
-    // This prevents bilinear filtering from accidentally pulling in black/transparent 
-    // pixels from the void outside the texture space.
-    vec2 margin = vec2(1.2) / resolution;
-    #define SAFE(u) clamp(u, margin, 1.0 - margin)
+    // Apply color saturation, contrast and brightness once for every material.
+    vec3 adjustedRefracted = applySCB(refractedRgb, brightness, contrast, saturation);
 
-    // Step 2: Multi-tap Sampling (Averaging 4 sub-pixels to smooth out the image)
-    vec3 refractedRgb = vec3(
-        (texture2D(cogl_sampler1, SAFE(uvR + off1)).r +
-         texture2D(cogl_sampler1, SAFE(uvR + off2)).r +
-         texture2D(cogl_sampler1, SAFE(uvR + off3)).r +
-         texture2D(cogl_sampler1, SAFE(uvR + off4)).r) * 0.25,
-
-        (texture2D(cogl_sampler1, SAFE(uvG + off1)).g +
-         texture2D(cogl_sampler1, SAFE(uvG + off2)).g +
-         texture2D(cogl_sampler1, SAFE(uvG + off3)).g +
-         texture2D(cogl_sampler1, SAFE(uvG + off4)).g) * 0.25,
-
-        (texture2D(cogl_sampler1, SAFE(uvB + off1)).b +
-         texture2D(cogl_sampler1, SAFE(uvB + off2)).b +
-         texture2D(cogl_sampler1, SAFE(uvB + off3)).b +
-         texture2D(cogl_sampler1, SAFE(uvB + off4)).b) * 0.25
-    );
-
-    // Apply color saturation, contrast, brightness
-    vec3 adjustedRefracted = applySCB(refractedRgb, brightness, contrast, saturation); 
+    // Frost is a material treatment over the existing blur, not another blur
+    // pass. Diffusion gently desaturates and lifts the surface; stable grain
+    // breaks up the mathematically-perfect blur without temporal noise.
+    if (isFrosted || isHybrid) {
+        float frostAmount = clamp(frosted_strength, 0.0, 1.0) * (isHybrid ? 0.45 : 1.0);
+        float frostLuma = dot(adjustedRefracted, vec3(0.2126, 0.7152, 0.0722));
+        adjustedRefracted = mix(adjustedRefracted, vec3(frostLuma), frostAmount * 0.30);
+        adjustedRefracted = mix(adjustedRefracted, vec3(1.0), frostAmount * 0.08);
+        float grain = (frostNoise(pixel_coord) - 0.5) * frosted_grain * frostAmount;
+        adjustedRefracted = clamp(adjustedRefracted + vec3(grain), 0.0, 1.0);
+    }
     vec3 refracted = adjustedRefracted;
 
     // [FIX-8] Two independent, composable tint layers over the refracted

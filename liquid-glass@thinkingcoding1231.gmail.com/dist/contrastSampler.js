@@ -193,7 +193,7 @@ export class StageContrastSampler {
             if (!merged)
                 return result;
             const luma = await this.sampleLuminance(merged);
-            if (!luma)
+            if (luma === null)
                 return result;
             const color = this.decideTextColor(luma, config);
             if (!color)
@@ -204,7 +204,7 @@ export class StageContrastSampler {
         }
         for (let i = 0; i < targets.length; i++) {
             const luma = await this.sampleLuminance(rects[i]);
-            if (!luma)
+            if (luma === null)
                 return result;
             const color = this.decideTextColor(luma, config);
             if (color)

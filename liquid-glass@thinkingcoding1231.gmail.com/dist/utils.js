@@ -1266,12 +1266,19 @@ export class UILayerSampler {
             // the glass subtree stops being allocated.
             if (sourceClone.x !== 0 || sourceClone.y !== 0)
                 sourceClone.set_position(0, 0);
-            sourceClone.translation_x = absX;
-            sourceClone.translation_y = absY;
-            sourceClone.set_size(scaledW, scaledH);
-            sourceClone.set_scale(1.0, 1.0);
-            sourceClone.set_pivot_point(0, 0);
-            sourceClone.opacity = source.opacity;
+            if (sourceClone.translation_x !== absX)
+                sourceClone.translation_x = absX;
+            if (sourceClone.translation_y !== absY)
+                sourceClone.translation_y = absY;
+            if (sourceClone.width !== scaledW || sourceClone.height !== scaledH)
+                sourceClone.set_size(scaledW, scaledH);
+            if (sourceClone.scale_x !== 1.0 || sourceClone.scale_y !== 1.0)
+                sourceClone.set_scale(1.0, 1.0);
+            const [clonePivotX, clonePivotY] = sourceClone.get_pivot_point();
+            if (clonePivotX !== 0 || clonePivotY !== 0)
+                sourceClone.set_pivot_point(0, 0);
+            if (sourceClone.opacity !== source.opacity)
+                sourceClone.opacity = source.opacity;
             this._checkCloneDrift(source, sourceClone, absX, absY);
             const localX = absX - cX;
             const localY = absY - cY;
@@ -1295,7 +1302,7 @@ export class UILayerSampler {
     // report. Logged on entry and exit only, so a stuck clone costs two lines
     // instead of 60 per second.
     _checkCloneDrift(source, sourceClone, expectX, expectY) {
-        if (!_utilsLogger)
+        if (!_utilsLogger?.enabled)
             return;
         try {
             const [gotX, gotY] = sourceClone.get_transformed_position();
@@ -1368,8 +1375,10 @@ export class UILayerSampler {
         if (this._uiClonesContainer) {
             if (this._uiClonesContainer.x !== 0 || this._uiClonesContainer.y !== 0)
                 this._uiClonesContainer.set_position(0, 0);
-            this._uiClonesContainer.translation_x = -contAbsX;
-            this._uiClonesContainer.translation_y = -contAbsY;
+            if (this._uiClonesContainer.translation_x !== -contAbsX)
+                this._uiClonesContainer.translation_x = -contAbsX;
+            if (this._uiClonesContainer.translation_y !== -contAbsY)
+                this._uiClonesContainer.translation_y = -contAbsY;
         }
         for (const [actor, sourceClone] of this._clones) {
             this.syncProperties(actor, sourceClone, contW, contH, contAbsX, contAbsY);
@@ -1471,14 +1480,18 @@ export class WindowCloneManager {
         if (this.windowClonesContainer) {
             if (this.windowClonesContainer.x !== 0 || this.windowClonesContainer.y !== 0)
                 this.windowClonesContainer.set_position(0, 0);
-            this.windowClonesContainer.translation_x = x;
-            this.windowClonesContainer.translation_y = y;
+            if (this.windowClonesContainer.translation_x !== x)
+                this.windowClonesContainer.translation_x = x;
+            if (this.windowClonesContainer.translation_y !== y)
+                this.windowClonesContainer.translation_y = y;
         }
         if (this.bgClone) {
             if (this.bgClone.x !== 0 || this.bgClone.y !== 0)
                 this.bgClone.set_position(0, 0);
-            this.bgClone.translation_x = x;
-            this.bgClone.translation_y = y;
+            if (this.bgClone.translation_x !== x)
+                this.bgClone.translation_x = x;
+            if (this.bgClone.translation_y !== y)
+                this.bgClone.translation_y = y;
         }
     }
     sync() {
@@ -1529,11 +1542,13 @@ export class WindowCloneManager {
                 clone.connect('destroy', () => { this._windowClones.delete(w); });
                 this.windowClonesContainer?.add_child(clone);
                 this._windowClones.set(w, clone);
+                clone.remove_transition('position');
+                clone.remove_transition('size');
+                clone.remove_transition('translation-x');
+                clone.remove_transition('translation-y');
+                clone.remove_transition('scale-x');
+                clone.remove_transition('scale-y');
             }
-            clone.remove_transition('position');
-            clone.remove_transition('size');
-            clone.remove_transition('translation-x');
-            clone.remove_transition('translation-y');
             // [FIX] Place the clone with translation_x/y, NOT set_position().
             //
             // set_position() only moves the actor once Clutter has run a relayout
@@ -1560,15 +1575,21 @@ export class WindowCloneManager {
             // that cannot be starved by the layout system does not go stale.
             if (clone.x !== 0 || clone.y !== 0)
                 clone.set_position(0, 0);
-            clone.translation_x = w.x + w.translation_x;
-            clone.translation_y = w.y + w.translation_y;
-            clone.set_size(width, height);
-            clone.remove_transition('scale-x');
-            clone.remove_transition('scale-y');
-            clone.set_scale(w.scale_x, w.scale_y);
+            const cloneX = w.x + w.translation_x;
+            const cloneY = w.y + w.translation_y;
+            if (clone.translation_x !== cloneX)
+                clone.translation_x = cloneX;
+            if (clone.translation_y !== cloneY)
+                clone.translation_y = cloneY;
+            if (clone.width !== width || clone.height !== height)
+                clone.set_size(width, height);
+            if (clone.scale_x !== w.scale_x || clone.scale_y !== w.scale_y)
+                clone.set_scale(w.scale_x, w.scale_y);
             let pX = w.pivot_point ? w.pivot_point.x : 0;
             let pY = w.pivot_point ? w.pivot_point.y : 0;
-            clone.set_pivot_point(pX, pY);
+            const [currentPX, currentPY] = clone.get_pivot_point();
+            if (currentPX !== pX || currentPY !== pY)
+                clone.set_pivot_point(pX, pY);
             // Clutter.Clone paints its source with the clone's own opacity, not
             // the source's — so without this the glass shows a window at full
             // opacity for the whole of GNOME's map/destroy animation, which eases
@@ -1576,8 +1597,10 @@ export class WindowCloneManager {
             // That is the "the clone is offset/too solid during the open and
             // close animation" artifact: the geometry follows the animation but
             // the fade does not.
-            clone.opacity = w.opacity;
-            this.windowClonesContainer?.set_child_at_index(clone, zIndex);
+            if (clone.opacity !== w.opacity)
+                clone.opacity = w.opacity;
+            if (this.windowClonesContainer?.get_child_at_index(zIndex) !== clone)
+                this.windowClonesContainer?.set_child_at_index(clone, zIndex);
             zIndex++;
         }
         // Remove clones for windows that closed, or all of them when the
